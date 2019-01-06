@@ -1,6 +1,7 @@
 package router
 
 import (
+	"sync"
 	"time"
 
 	"storage"
@@ -31,7 +32,10 @@ type Config struct {
 
 // Router is a router service.
 type Router struct {
-	// TODO: implement
+	cfg Config
+
+	lock       sync.RWMutex
+	heartbeats map[storage.ServiceAddr]time.Time
 }
 
 // New creates a new Router with a given cfg.
@@ -42,18 +46,36 @@ type Router struct {
 // Возвращает ошибку storage.ErrNotEnoughDaemons если в cfg.Nodes
 // меньше чем storage.ReplicationFactor nodes.
 func New(cfg Config) (*Router, error) {
-	// TODO: implement
-	return nil, nil
+	if len(cfg.Nodes) < storage.ReplicationFactor {
+		return nil, storage.ErrNotEnoughDaemons
+	}
+
+	r := &Router{
+		cfg:        cfg,
+		heartbeats: make(map[storage.ServiceAddr]time.Time, len(cfg.Nodes)),
+	}
+	for _, node := range cfg.Nodes {
+		r.heartbeats[node] = time.Time{}
+	}
+
+	return r, nil
 }
 
-// Hearbeat registers node in the router.
+// Heartbeat registers node in the router.
 // Returns storage.ErrUnknownDaemon error if node is not served by the Router.
-
-// Hearbeat регистритрует node в router.
+//
+// Heartbeat регистритрует node в router.
 // Возвращает ошибку storage.ErrUnknownDaemon если node не
 // обслуживается Router.
 func (r *Router) Heartbeat(node storage.ServiceAddr) error {
-	// TODO: implement
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
+	if _, ok := r.heartbeats[node]; !ok {
+		return storage.ErrUnknownDaemon
+	}
+	r.heartbeats[node] = time.Now()
+
 	return nil
 }
 
@@ -65,14 +87,27 @@ func (r *Router) Heartbeat(node storage.ServiceAddr) error {
 // запись с ключом k. Возвращает ошибку storage.ErrNotEnoughDaemons
 // если меньше, чем storage.MinRedundancy найдено.
 func (r *Router) NodesFind(k storage.RecordID) ([]storage.ServiceAddr, error) {
-	// TODO: implement
-	return nil, nil
+	possibleNodes := r.cfg.NodesFinder.NodesFind(k, r.cfg.Nodes)
+	activeNodes := make([]storage.ServiceAddr, 0, len(possibleNodes))
+
+	for _, node := range possibleNodes {
+		r.lock.RLock()
+		if t, ok := r.heartbeats[node]; ok && !t.Add(r.cfg.ForgetTimeout).Before(time.Now()) {
+			activeNodes = append(activeNodes, node)
+		}
+		defer r.lock.RUnlock()
+	}
+
+	if len(activeNodes) < storage.MinRedundancy {
+		return nil, storage.ErrNotEnoughDaemons
+	}
+
+	return activeNodes, nil
 }
 
 // List returns a list of all nodes served by Router.
 //
 // List возвращает cписок всех node, обслуживаемых Router.
 func (r *Router) List() []storage.ServiceAddr {
-	// TODO: implement
-	return nil
+	return r.cfg.Nodes
 }

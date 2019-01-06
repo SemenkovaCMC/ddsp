@@ -12,7 +12,7 @@ import (
 	"storage/pb"
 )
 
-const Timeout = time.Second
+const Timeout = 3 * time.Second
 
 type Storage interface {
 	Put(k RecordID, d []byte) error
@@ -27,6 +27,7 @@ type Server struct {
 }
 
 func NewServer(st Storage, addr string) *Server {
+	// log.SetOutput(os.Stdout)
 	return &Server{
 		addr: addr,
 		st:   st,

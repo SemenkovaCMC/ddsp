@@ -1,6 +1,7 @@
 package frontend
 
 import (
+	"sync"
 	"time"
 
 	rclient "router/client"
@@ -38,15 +39,19 @@ type Config struct {
 
 // Frontend is a frontend service.
 type Frontend struct {
-	// TODO: implement
+	cfg  Config
+	once sync.Once
+
+	nodes []storage.ServiceAddr
 }
 
 // New creates a new Frontend with a given cfg.
 //
 // New создает новый Frontend с данным cfg.
 func New(cfg Config) *Frontend {
-	// TODO: implement
-	return nil
+	return &Frontend{
+		cfg: cfg,
+	}
 }
 
 // Put an item to the storage if an item for the given key doesn't exist.
@@ -55,8 +60,9 @@ func New(cfg Config) *Frontend {
 // Put -- добавить запись в хранилище, если запись для данного ключа
 // не существует. Иначе вернуть ошибку.
 func (fe *Frontend) Put(k storage.RecordID, d []byte) error {
-	// TODO: implement
-	return nil
+	return fe.doQuorumAction(k, func(node storage.ServiceAddr) error {
+		return fe.cfg.NC.Put(node, k, d)
+	})
 }
 
 // Del an item from the storage if an item exists for the given key.
@@ -65,8 +71,48 @@ func (fe *Frontend) Put(k storage.RecordID, d []byte) error {
 // Del -- удалить запись из хранилища, если запись для данного ключа
 // существует. Иначе вернуть ошибку.
 func (fe *Frontend) Del(k storage.RecordID) error {
-	// TODO: implement
-	return nil
+	return fe.doQuorumAction(k, func(node storage.ServiceAddr) error {
+		return fe.cfg.NC.Del(node, k)
+	})
+}
+
+func (fe *Frontend) doQuorumAction(k storage.RecordID, action func(node storage.ServiceAddr) error) error {
+	nodes, err := fe.cfg.RC.NodesFind(fe.cfg.Router, k)
+	if err != nil {
+		return err
+	}
+	if len(nodes) < storage.MinRedundancy {
+		return storage.ErrNotEnoughDaemons
+	}
+
+	errs := make(chan error, len(nodes))
+	for _, node := range nodes {
+		go func(node storage.ServiceAddr) {
+			errs <- action(node)
+		}(node)
+	}
+
+	errMap := make(map[error]int)
+	success := 0
+	for range nodes {
+		err := <-errs
+		if err != nil {
+			errMap[err]++
+		} else {
+			success++
+		}
+	}
+
+	if success >= storage.MinRedundancy {
+		return nil
+	}
+	for err, count := range errMap {
+		if count >= storage.MinRedundancy {
+			return err
+		}
+	}
+	// fmt.Printf("ErrQuorumNotReached: k = %+v nodes = %+v MinRedundancy = %+v errMap = %+v\n", k, nodes, storage.MinRedundancy, errMap)
+	return storage.ErrQuorumNotReached
 }
 
 // Get an item from the storage if an item exists for the given key.
@@ -75,6 +121,70 @@ func (fe *Frontend) Del(k storage.RecordID) error {
 // Get -- получить запись из хранилища, если запись для данного ключа
 // существует. Иначе вернуть ошибку.
 func (fe *Frontend) Get(k storage.RecordID) ([]byte, error) {
-	// TODO: implement
-	return nil, nil
+	fe.once.Do(func() {
+		for {
+			var err error
+			fe.nodes, err = fe.cfg.RC.List(fe.cfg.Router)
+			if err == nil {
+				break
+			}
+			time.Sleep(InitTimeout)
+		}
+	})
+
+	nodes := fe.cfg.NF.NodesFind(k, fe.nodes)
+	if len(nodes) < storage.MinRedundancy {
+		return nil, storage.ErrNotEnoughDaemons
+	}
+
+	type result struct {
+		d   []byte
+		err error
+	}
+
+	resChan := make(chan result, len(nodes))
+	endChan := make(chan result)
+
+	go func() {
+		resMap := make(map[string]int)
+		errMap := make(map[error]int)
+
+		for i := 0; i < len(nodes); i++ {
+			res := <-resChan
+			if res.err == nil {
+				key := string(res.d)
+				resMap[key]++
+
+				if resMap[key] >= storage.MinRedundancy {
+					endChan <- res
+					return
+				}
+			} else {
+				key := res.err
+				errMap[key]++
+
+				if errMap[key] >= storage.MinRedundancy {
+					endChan <- res
+					return
+				}
+			}
+		}
+
+		endChan <- result{
+			err: storage.ErrQuorumNotReached,
+		}
+	}()
+
+	for _, node := range nodes {
+		go func(node storage.ServiceAddr) {
+			d, err := fe.cfg.NC.Get(node, k)
+			resChan <- struct {
+				d   []byte
+				err error
+			}{d, err}
+		}(node)
+	}
+
+	res := <-endChan
+	return res.d, res.err
 }
